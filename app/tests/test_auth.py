@@ -1,6 +1,6 @@
 import asyncio
 
-import httpx
+import httpx2
 import pytest
 from starlette.applications import Starlette
 from starlette.responses import PlainTextResponse
@@ -25,12 +25,12 @@ def test_strip_scheme(header, token):
     assert server.strip_scheme(header) == token
 
 
-def _send(header: str | None) -> httpx.Request:
+def _send(header: str | None) -> httpx2.Request:
     """Run PaperlessTokenAuth over a request with `header` as the captured
     client Authorization, and return the outgoing request."""
     reset = server._incoming_auth.set(header)
     try:
-        flow = server.PaperlessTokenAuth().auth_flow(httpx.Request("GET", "http://p/api/"))
+        flow = server.PaperlessTokenAuth().auth_flow(httpx2.Request("GET", "http://p/api/"))
         return next(flow)
     finally:
         server._incoming_auth.reset(reset)
@@ -90,12 +90,12 @@ def test_full_chain_forwards_the_token_and_api_version():
     through the real ASGI app end-to-end."""
     captured = {}
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         captured["auth"] = request.headers.get("Authorization")
         captured["accept"] = request.headers.get("Accept")
         if request.url.path == "/api/statistics/":
-            return httpx.Response(200, json=STATISTICS)
-        return httpx.Response(404, json={"detail": "Not found."})
+            return httpx2.Response(200, json=STATISTICS)
+        return httpx2.Response(404, json={"detail": "Not found."})
 
     inner = build(handler).http_app(path=server.DEFAULT_PATH)
 

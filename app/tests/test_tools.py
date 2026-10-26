@@ -1,7 +1,7 @@
 import asyncio
 import base64
 
-import httpx
+import httpx2
 import pytest
 from fastmcp.exceptions import ToolError
 
@@ -20,10 +20,10 @@ def _call(handler, tool, args):
 
 
 def _file_handler(seen: dict, body: bytes, content_type: str):
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         seen["path"] = request.url.path
         seen["query"] = dict(request.url.params)
-        return httpx.Response(200, content=body, headers={"content-type": content_type})
+        return httpx2.Response(200, content=body, headers={"content-type": content_type})
     return handler
 
 
@@ -36,7 +36,7 @@ def test_download_returns_the_binary_file():
     )
     resource = result.content[0].resource
     assert base64.b64decode(resource.blob) == PDF
-    assert resource.mimeType == "application/pdf"
+    assert resource.mime_type == "application/pdf"
     assert seen == {"path": "/api/documents/7/download/", "query": {"original": "true"}}
 
 
@@ -46,7 +46,7 @@ def test_thumb_returns_an_image():
         _file_handler(seen, b"RIFF....WEBP", "image/webp"), "documents_thumb_retrieve", {"id": 7}
     )
     assert result.content[0].type == "image"
-    assert result.content[0].mimeType == "image/webp"
+    assert result.content[0].mime_type == "image/webp"
     assert seen["path"] == "/api/documents/7/thumb/"
 
 
@@ -59,11 +59,11 @@ def test_oversized_file_is_refused(monkeypatch):
 def test_upload_sends_a_multipart_form():
     seen = {}
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         seen["path"] = request.url.path
         seen["content_type"] = request.headers["content-type"]
         seen["body"] = request.content
-        return httpx.Response(200, json="0f3c-task-uuid")
+        return httpx2.Response(200, json="0f3c-task-uuid")
 
     result = _call(handler, server.UPLOAD_TOOL, {
         "filename": "note.txt", "content": "hello päper", "title": "A note",
@@ -84,9 +84,9 @@ def test_upload_sends_a_multipart_form():
 def test_upload_accepts_base64_for_binary_files():
     seen = {}
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         seen["body"] = request.content
-        return httpx.Response(200, json="task")
+        return httpx2.Response(200, json="task")
 
     _call(handler, server.UPLOAD_TOOL, {
         "filename": "scan.pdf", "content_base64": base64.b64encode(PDF).decode(),
@@ -104,19 +104,19 @@ def test_upload_accepts_base64_for_binary_files():
 )
 def test_upload_rejects_bad_content_arguments(args, message):
     with pytest.raises(ToolError, match=message):
-        _call(lambda r: httpx.Response(200, json="task"), server.UPLOAD_TOOL, args)
+        _call(lambda r: httpx2.Response(200, json="task"), server.UPLOAD_TOOL, args)
 
 
 def test_upload_reports_paperless_validation_errors():
     def handler(request):
-        return httpx.Response(400, json={"document": ["File type not supported"]})
+        return httpx2.Response(400, json={"document": ["File type not supported"]})
 
     with pytest.raises(ToolError, match="File type not supported"):
         _call(handler, server.UPLOAD_TOOL, {"filename": "a.xyz", "content": "x"})
 
 
 def test_generated_tools_name_their_endpoint_and_carry_no_output_schema():
-    tools = {t.name: t for t in asyncio.run(build(lambda r: httpx.Response(404)).list_tools())}
+    tools = {t.name: t for t in asyncio.run(build(lambda r: httpx2.Response(404)).list_tools())}
     assert tools["tags_list"].description.startswith("GET /api/tags/")
     assert tools["documents_destroy"].description.startswith("DELETE /api/documents/{id}/")
     # Paperless answers with arrays, scalars and empty bodies as well as
@@ -126,23 +126,23 @@ def test_generated_tools_name_their_endpoint_and_carry_no_output_schema():
 
 
 def _tools():
-    return {t.name: t for t in asyncio.run(build(lambda r: httpx.Response(404)).list_tools())}
+    return {t.name: t for t in asyncio.run(build(lambda r: httpx2.Response(404)).list_tools())}
 
 
 def _hints(tool):
     a = tool.annotations
-    return (a.readOnlyHint, a.destructiveHint, a.idempotentHint)
+    return (a.read_only_hint, a.destructive_hint, a.idempotent_hint)
 
 
 def test_every_tool_carries_behaviour_hints():
     for name, tool in _tools().items():
         hints = tool.annotations
         assert hints is not None, name
-        assert not (hints.readOnlyHint and hints.destructiveHint), name
+        assert not (hints.read_only_hint and hints.destructive_hint), name
         if name.endswith(("_list", "_retrieve")):
-            assert hints.readOnlyHint, name
+            assert hints.read_only_hint, name
         if name.endswith("_destroy"):
-            assert hints.destructiveHint, name
+            assert hints.destructive_hint, name
 
 
 @pytest.mark.parametrize(
@@ -203,16 +203,16 @@ def test_unguided_tools_get_a_note_from_their_method():
 
 
 def test_server_sends_instructions():
-    mcp = build(lambda r: httpx.Response(404))
+    mcp = build(lambda r: httpx2.Response(404))
     assert "fields" in mcp.instructions and "confirmation" in mcp.instructions
 
 
 def test_array_response_passes_through():
     notes = [{"id": 1, "note": "hello"}]
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         assert request.url.path == "/api/documents/7/notes/"
-        return httpx.Response(200, json=notes)
+        return httpx2.Response(200, json=notes)
 
     result = _call(handler, "documents_notes_list", {"id": 7})
     assert '"note":"hello"' in result.content[0].text.replace(" ", "")
@@ -221,9 +221,9 @@ def test_array_response_passes_through():
 def test_fields_are_sent_comma_separated():
     seen = {}
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         seen["fields"] = request.url.params.get_list("fields")
-        return httpx.Response(200, json={"count": 0, "results": []})
+        return httpx2.Response(200, json={"count": 0, "results": []})
 
     _call(handler, "documents_list", {"fields": ["id", "title"]})
     assert seen["fields"] == ["id,title"]
@@ -247,16 +247,16 @@ def test_mail_account_process_takes_only_the_id(monkeypatch):
     # The spec gives the process action the whole account, password included,
     # as a required body; Paperless reads only the ID from the path.
     monkeypatch.setenv(server.TOOLSETS_ENV, "mail_accounts")
-    tools = {t.name: t for t in asyncio.run(build(lambda r: httpx.Response(404)).list_tools())}
+    tools = {t.name: t for t in asyncio.run(build(lambda r: httpx2.Response(404)).list_tools())}
     params = tools["mail_account_process"].parameters
     assert set(params["properties"]) == {"id"}
     assert params.get("required") == ["id"]
 
     seen = {}
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         seen["method"], seen["path"], seen["body"] = request.method, request.url.path, request.content
-        return httpx.Response(200, json={"result": "OK"})
+        return httpx2.Response(200, json={"result": "OK"})
 
     result = _call(handler, "mail_account_process", {"id": 3})
     assert seen["method"] == "POST" and seen["path"] == "/api/mail_accounts/3/process/"

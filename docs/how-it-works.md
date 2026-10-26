@@ -77,7 +77,7 @@ sequenceDiagram
       box rgba(76, 165, 62, 0.1) Paperless-ngx MCP server
         participant MW as TokenCapture<br>Middleware
         participant F as FastMCP<br>tools
-        participant H as httpx +<br>PaperlessTokenAuth
+        participant H as httpx2 +<br>PaperlessTokenAuth
       end
       participant P as Paperless-ngx
       Note over C,P: Missing token
@@ -100,7 +100,7 @@ sequenceDiagram
 
 ## OAuth
 
-A one-time browser login fetches the user's API token. After that, the client only holds opaque OAuth tokens that map to it.
+A one-time browser login fetches the user's API token. After that, the client only holds opaque OAuth tokens that map to it. The OAuth machinery (discovery, registration, login page, token store) comes from the shared [mcp-login-oauth](https://github.com/Marceltov/mcp-login-oauth) library; this server supplies the login fields and the Paperless check.
 
 ```mermaid
 sequenceDiagram
@@ -172,7 +172,7 @@ sequenceDiagram
       box rgba(76, 165, 62, 0.1) Paperless-ngx MCP server
         participant F as FastMCP<br>auth + tools
         participant A as verify_token
-        participant H as httpx +<br>PaperlessTokenAuth
+        participant H as httpx2 +<br>PaperlessTokenAuth
       end
       participant P as Paperless-ngx
       C->>F: POST /mcp<br>Bearer pmcp_ token or raw API token
@@ -180,15 +180,15 @@ sequenceDiagram
       F->>A: verify_token(token)
       A->>A: Look up in the<br>mcp-oauth store
       alt Issued by us (pmcp_)
-        A-->>F: paperless_token = mapped token
+        A-->>F: grant = mapped token
       else Not ours, both mode
-        A-->>F: paperless_token = the raw token
+        A-->>F: grant = the raw token
       else Expired or revoked, or oauth mode
         A-->>F: None
         F-->>C: 401, client refreshes or logs in
       end
       F->>H: Call the mapped<br>API operation
-      H->>H: Read paperless_token<br>from the access token
+      H->>H: Read the grant<br>from the access token
       H->>P: /api/…<br>Authorization: Token …
       P-->>H: JSON
       H-->>F: Response

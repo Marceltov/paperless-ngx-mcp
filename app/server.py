@@ -17,48 +17,35 @@
 
 import base64
 import binascii
-import html
 import json
 import os
 import re
-import secrets
 import sys
 import time
 import traceback
 from contextvars import ContextVar
 from pathlib import Path
-from urllib.parse import urlsplit
 
-import httpx
+import httpx2
 import uvicorn
 import yaml
 from fastmcp import FastMCP
-from fastmcp.server.auth import AccessToken, OAuthProvider
-from fastmcp.server.auth.auth import ClientRegistrationOptions, RevocationOptions
 from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.providers.openapi import OpenAPITool
 from fastmcp.utilities.types import File, Image
 from key_value.aio.protocols import AsyncKeyValue
-from key_value.aio.stores.filetree import (
-    FileTreeStore,
-    FileTreeV1CollectionSanitizationStrategy,
-    FileTreeV1KeySanitizationStrategy,
-)
-from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
-from mcp.server.auth.provider import (
-    AuthorizationCode,
-    AuthorizationParams,
-    RefreshToken,
-    TokenError,
-    construct_redirect_uri,
-)
 from mcp.server.auth.routes import validate_issuer_url
-from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from mcp.types import ToolAnnotations
+from mcp_login_oauth import (
+    BearerPrefixMiddleware,
+    LoginField,
+    LoginOAuthProvider,
+    LoginRejected,
+    build_store,
+)
 from pydantic import AnyHttpUrl
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse
-from starlette.routing import Route
+from starlette.responses import PlainTextResponse
 
 # A snapshot of the Paperless-ngx OpenAPI spec ships alongside this server
 # (baked into the image). It is only the fallback: at startup the spec is
@@ -133,13 +120,12 @@ REPLACED_PATHS = (*FILE_PATHS.values(), UPLOAD_PATH)
 # A file travels base64-encoded inside the tool result, so cap what we return.
 MAX_FILE_BYTES = 10 * 1024 * 1024
 
-# OAuth (see PaperlessOAuthProvider). Issued codes/tokens carry this prefix so a
+# OAuth (see build_oauth_provider). Issued codes/tokens carry this prefix so a
 # stale one is recognizably ours and is never mistaken for a Paperless API token.
 OAUTH_TOKEN_PREFIX = "pmcp_"
-PENDING_LOGIN_TTL = 10 * 60
-AUTH_CODE_TTL = 5 * 60
-ACCESS_TOKEN_TTL = 60 * 60
-REFRESH_TOKEN_TTL = 30 * 24 * 60 * 60
+# v2: the mcp-login-oauth record shape. Entries under the old salt no longer
+# decrypt, so they read as misses and their clients simply log in again.
+OAUTH_STORE_SALT = "paperless-ngx-mcp-oauth-v2"
 
 # Per-request holder for the incoming client Authorization header. Populated by
 # TokenCaptureMiddleware and read by PaperlessTokenAuth when calling Paperless.
@@ -153,19 +139,19 @@ def strip_scheme(value: str) -> str:
     return rest.strip() if scheme.lower() in ("bearer", "token") else value.strip()
 
 
-class PaperlessTokenAuth(httpx.Auth):
+class PaperlessTokenAuth(httpx2.Auth):
     """Forward the client's Paperless API token to Paperless.
 
-    With OAuth (see PaperlessOAuthProvider), FastMCP's request-scoped access
-    token carries the API token in `claims["paperless_token"]`. Otherwise the
-    token is the raw client header in the `_incoming_auth` contextvar (set by
+    With OAuth (see build_oauth_provider), FastMCP's request-scoped access
+    token carries the API token in its grant (`claims["grant"]["paperless_token"]`).
+    Otherwise the token is the raw client header in the `_incoming_auth` contextvar (set by
     TokenCaptureMiddleware). Paperless expects `Authorization: Token <token>`,
     so whatever prefix the client used is replaced with that.
     """
 
-    def auth_flow(self, request: httpx.Request):
+    def auth_flow(self, request: httpx2.Request):
         access = get_access_token()
-        raw = access.claims.get("paperless_token") if access else _incoming_auth.get()
+        raw = access.claims["grant"]["paperless_token"] if access else _incoming_auth.get()
         token = strip_scheme(raw) if raw else ""
         if not token:
             raise RuntimeError(
@@ -219,65 +205,7 @@ class TokenCaptureMiddleware:
             _incoming_auth.reset(token)
 
 
-def _page(inner: str, status: int = 200) -> HTMLResponse:
-    """Minimal standalone HTML page for the login flow."""
-    body = (
-        '<!doctype html><html><head><meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width, initial-scale=1">'
-        "<title>Paperless MCP login</title><style>body{font-family:system-ui,"
-        "sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem;line-height:1.5}"
-        "input,button{font:inherit;padding:.4rem;margin:.3rem 0;width:100%;"
-        "box-sizing:border-box}details{margin:1rem 0}summary{cursor:pointer}"
-        f"</style></head><body><h1>Paperless MCP</h1>{inner}</body></html>"
-    )
-    # DENY framing so the password form can't be clickjacked.
-    return HTMLResponse(body, status_code=status, headers={"X-Frame-Options": "DENY"})
-
-
-def _login_page(pending_id, client_name, redirect_host, error="", status=200):
-    """The one page a human sees: who is asking, where the code goes, and the
-    Paperless credentials (or, for single-sign-on accounts, an API token)."""
-    e = html.escape
-    err = f'<p style="color:#b00">{e(error)}</p>' if error else ""
-    return _page(
-        f"{err}<p><b>{e(client_name)}</b> wants access to your Paperless-ngx "
-        f"documents. After login you will be sent to <b>{e(redirect_host)}</b>. "
-        f"Only continue if you started this.</p>"
-        f'<form method="post"><input type="hidden" name="id" value="{e(pending_id)}">'
-        f'<label>Paperless username <input name="username" autocomplete="username" '
-        f"autofocus></label>"
-        f'<label>Paperless password <input type="password" name="password" '
-        f'autocomplete="current-password"></label>'
-        f'<label>Two-factor code, if enabled <input name="code" inputmode="numeric" '
-        f'autocomplete="one-time-code"></label>'
-        f"<details><summary>Signed in through single sign-on, with no Paperless "
-        f"password?</summary><p>Paste the API token from <i>My Profile</i> in "
-        f"Paperless instead, and leave the fields above empty.</p>"
-        f'<label>API token <input type="password" name="token" autocomplete="off">'
-        f"</label></details><button>Authorize</button></form>",
-        status,
-    )
-
-
-def _dead_end_page(heading: str, what: str, status: int) -> HTMLResponse:
-    """A login that can't continue from here. The usual cause is the MCP app
-    interrupting its own OAuth flow -- claude.ai asking the user to log in to
-    claude.ai partway through, then dropping the finished login -- so say that,
-    say it isn't the server's fault, and give the fix."""
-    return _page(
-        f"<h2>{html.escape(heading)}</h2><p>{html.escape(what)}</p>"
-        "<p><b>Why:</b> your app interrupted its own login. Most often it asked "
-        "you to log in to the app itself (for example claude.ai) partway through, "
-        "then lost track of this login. Nothing is wrong with your Paperless or "
-        "this MCP server.</p>"
-        "<p><b>Fix:</b> go back to your app and remove this connector and add it "
-        "again, or use its Reconnect / Authenticate button. Being logged in to "
-        "the app first avoids the interruption.</p>",
-        status,
-    )
-
-
-def _rejection(response: httpx.Response) -> str:
+def _rejection(response: httpx2.Response) -> str:
     """Paperless's own reason for refusing a login, when it gives one: wrong
     credentials or a missing two-factor code (`non_field_errors`), or its login
     throttle (`detail`, HTTP 429 -- five attempts a minute by default, counted
@@ -290,273 +218,6 @@ def _rejection(response: httpx.Response) -> str:
     if isinstance(reason, list):
         reason = " ".join(str(x) for x in reason)
     return f"Paperless rejected the login: {reason or f'HTTP {response.status_code}'}"
-
-
-class PaperlessOAuthProvider(OAuthProvider):
-    """OAuth 2.1 authorization server whose login is the Paperless login.
-
-    FastMCP/the MCP SDK serve discovery, dynamic client registration,
-    /authorize, /token (PKCE) and /revoke on top of these methods. Logging in
-    trades the username and password for the user's API token via Paperless's
-    /api/token/ (which creates the token if the user has none); every code and
-    token we issue maps to it, and verify_token hands it to PaperlessTokenAuth
-    through the access token's `paperless_token` claim.
-
-    `passthrough` is `both` mode: a bearer that isn't one of ours is forwarded
-    to Paperless as a raw API token, exactly as in `token` mode.
-    """
-
-    def __init__(
-        self,
-        *,
-        base_url: str,
-        store: AsyncKeyValue,
-        paperless: httpx.AsyncClient,
-        passthrough: bool,
-    ):
-        super().__init__(
-            base_url=base_url,
-            client_registration_options=ClientRegistrationOptions(enabled=True),
-            revocation_options=RevocationOptions(enabled=True),
-        )
-        self.store = store
-        self.paperless = paperless  # unauthenticated: only the login exchange
-        self.passthrough = passthrough
-
-    async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
-        data = await self.store.get(client_id, collection="clients")
-        return OAuthClientInformationFull.model_validate(data) if data else None
-
-    async def register_client(self, client_info: OAuthClientInformationFull) -> None:
-        await self.store.put(
-            client_info.client_id,
-            client_info.model_dump(mode="json"),
-            collection="clients",
-        )
-
-    async def authorize(
-        self, client: OAuthClientInformationFull, params: AuthorizationParams
-    ) -> str:
-        pending_id = secrets.token_urlsafe(32)
-        await self.store.put(
-            pending_id,
-            {"client_id": client.client_id, "params": params.model_dump(mode="json")},
-            collection="pending",
-            ttl=PENDING_LOGIN_TTL,
-        )
-        return f"{str(self.base_url).rstrip('/')}/login?id={pending_id}"
-
-    async def load_authorization_code(
-        self, client: OAuthClientInformationFull, authorization_code: str
-    ) -> AuthorizationCode | None:
-        data = await self.store.get(authorization_code, collection="codes")
-        if not data or data["code"]["client_id"] != client.client_id:
-            return None
-        return AuthorizationCode.model_validate(data["code"])
-
-    async def exchange_authorization_code(
-        self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
-    ) -> OAuthToken:
-        data = await self.store.get(authorization_code.code, collection="codes")
-        if not data:
-            raise TokenError("invalid_grant", "Authorization code not found or already used.")
-        await self.store.delete(authorization_code.code, collection="codes")
-        return await self._issue(
-            client.client_id, authorization_code.scopes, data["paperless_token"]
-        )
-
-    async def load_refresh_token(
-        self, client: OAuthClientInformationFull, refresh_token: str
-    ) -> RefreshToken | None:
-        data = await self.store.get(refresh_token, collection="refresh")
-        if not data or data["client_id"] != client.client_id:
-            return None
-        return RefreshToken(
-            token=refresh_token,
-            client_id=data["client_id"],
-            scopes=data["scopes"],
-            expires_at=data["expires_at"],
-        )
-
-    async def exchange_refresh_token(
-        self,
-        client: OAuthClientInformationFull,
-        refresh_token: RefreshToken,
-        scopes: list[str],
-    ) -> OAuthToken:
-        data = await self.store.get(refresh_token.token, collection="refresh")
-        if not data:
-            raise TokenError("invalid_grant", "Refresh token not found or already used.")
-        if not set(scopes) <= set(refresh_token.scopes):
-            raise TokenError("invalid_scope", "Requested scopes exceed the original grant.")
-        # Rotate: the old pair dies, the Paperless token lives on in the new one.
-        await self._drop(data["access"], refresh_token.token)
-        return await self._issue(
-            client.client_id, scopes or refresh_token.scopes, data["paperless_token"]
-        )
-
-    async def load_access_token(self, token: str) -> AccessToken | None:
-        data = await self.store.get(token, collection="access")
-        if not data:
-            return None
-        return AccessToken(
-            token=token,
-            client_id=data["client_id"],
-            scopes=data["scopes"],
-            expires_at=data["expires_at"],
-            claims={"paperless_token": data["paperless_token"]},
-        )
-
-    async def verify_token(self, token: str) -> AccessToken | None:
-        found = await self.load_access_token(token)
-        if found or not self.passthrough or token.startswith(OAUTH_TOKEN_PREFIX):
-            return found
-        # `both` mode: not ours, so it's a raw API token; Paperless judges it.
-        return AccessToken(
-            token=token, client_id="paperless-token", scopes=[],
-            claims={"paperless_token": token},
-        )
-
-    async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
-        # Only our own pair is dropped. Paperless keeps ONE API token per user,
-        # shared by every client of that user and by the web UI's profile page,
-        # so deleting it here would disconnect all of them.
-        if isinstance(token, RefreshToken):
-            data = await self.store.get(token.token, collection="refresh")
-            pair = (data["access"], token.token) if data else None
-        else:
-            data = await self.store.get(token.token, collection="access")
-            pair = (token.token, data["refresh"]) if data else None
-        if pair:
-            await self._drop(*pair)
-
-    def get_routes(self, mcp_path: str | None = None) -> list[Route]:
-        return [
-            *super().get_routes(mcp_path),
-            Route("/login", self._login, methods=["GET", "POST"]),
-        ]
-
-    async def _paperless_token(self, form) -> tuple[str | None, str]:
-        """Turn the submitted login form into the user's Paperless API token:
-        (token, "") on success, (None, reason) when Paperless says no.
-
-        Credentials go straight to Paperless and are never stored or logged.
-        """
-        pasted = strip_scheme(form.get("token", ""))
-        if pasted:
-            # Single-sign-on accounts have no password to trade, so the user
-            # pastes the token; any authenticated endpoint tells us if it's real.
-            response = await self.paperless.get(
-                "/api/profile/", headers={"Authorization": f"Token {pasted}"}
-            )
-            if response.is_success:
-                return pasted, ""
-            return None, f"Paperless rejected the API token (HTTP {response.status_code})."
-        body = {
-            "username": form.get("username", ""),
-            "password": form.get("password", ""),
-        }
-        if not body["username"] or not body["password"]:
-            return None, "Enter your username and password, or an API token."
-        code = form.get("code", "").strip()
-        if code:
-            body["code"] = code
-        response = await self.paperless.post("/api/token/", json=body)
-        if not response.is_success:
-            return None, _rejection(response)
-        return response.json()["token"], ""
-
-    async def _login(self, request: Request):
-        form = await request.form() if request.method == "POST" else request.query_params
-        pending_id = form.get("id", "")
-        pending = (
-            await self.store.get(pending_id, collection="pending") if pending_id else None
-        )
-        if not pending:
-            return _dead_end_page(
-                "Login link expired or already used",
-                "Login links work once, for 10 minutes.",
-                400,
-            )
-        if pending.get("done"):
-            # A browser re-submitted a login that already succeeded (seen with
-            # claude.ai's connector flow). Issue nothing; say what happened.
-            return _dead_end_page(
-                "Login already completed",
-                "Your login was accepted and finished a moment ago; the browser "
-                "sent the form a second time. If your app now shows the "
-                "connector without tools, it dropped that finished login.",
-                200,
-            )
-        params = AuthorizationParams.model_validate(pending["params"])
-        client = await self.get_client(pending["client_id"])
-        client_name = (client.client_name if client else None) or pending["client_id"]
-        redirect = str(params.redirect_uri)
-        page = (pending_id, client_name, urlsplit(redirect).netloc or redirect)
-        if request.method == "GET":
-            return _login_page(*page)
-
-        paperless_token, error = await self._paperless_token(form)
-        if not paperless_token:
-            return _login_page(*page, error=error, status=401)
-        # Keep a short-lived marker instead of deleting, so a replayed form gets
-        # an honest answer (see above) rather than "expired".
-        await self.store.put(
-            pending_id, {"done": True}, collection="pending", ttl=PENDING_LOGIN_TTL
-        )
-        code = AuthorizationCode(
-            code=OAUTH_TOKEN_PREFIX + secrets.token_urlsafe(32),
-            client_id=pending["client_id"],
-            scopes=params.scopes or [],
-            expires_at=time.time() + AUTH_CODE_TTL,
-            code_challenge=params.code_challenge,
-            redirect_uri=params.redirect_uri,
-            redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
-            resource=params.resource,
-        )
-        await self.store.put(
-            code.code,
-            {"code": code.model_dump(mode="json"), "paperless_token": paperless_token},
-            collection="codes",
-            ttl=AUTH_CODE_TTL,
-        )
-        return RedirectResponse(
-            construct_redirect_uri(redirect, code=code.code, state=params.state),
-            status_code=302,
-        )
-
-    async def _issue(
-        self, client_id: str, scopes: list[str], paperless_token: str
-    ) -> OAuthToken:
-        access = OAUTH_TOKEN_PREFIX + secrets.token_urlsafe(32)
-        refresh = OAUTH_TOKEN_PREFIX + secrets.token_urlsafe(32)
-        now = int(time.time())
-        common = {
-            "client_id": client_id, "scopes": scopes, "paperless_token": paperless_token,
-        }
-        await self.store.put(
-            access,
-            {**common, "refresh": refresh, "expires_at": now + ACCESS_TOKEN_TTL},
-            collection="access",
-            ttl=ACCESS_TOKEN_TTL,
-        )
-        await self.store.put(
-            refresh,
-            {**common, "access": access, "expires_at": now + REFRESH_TOKEN_TTL},
-            collection="refresh",
-            ttl=REFRESH_TOKEN_TTL,
-        )
-        return OAuthToken(
-            access_token=access,
-            token_type="Bearer",
-            expires_in=ACCESS_TOKEN_TTL,
-            refresh_token=refresh,
-            scope=" ".join(scopes) or None,
-        )
-
-    async def _drop(self, access: str, refresh: str) -> None:
-        await self.store.delete(access, collection="access")
-        await self.store.delete(refresh, collection="refresh")
 
 
 def server_url() -> str:
@@ -597,16 +258,16 @@ def download_spec(url: str, wait: float) -> dict:
     deadline = time.monotonic() + wait
     while True:
         try:
-            response = httpx.get(
+            response = httpx2.get(
                 url, params={"format": "json"}, timeout=30, follow_redirects=True
             )
             if response.status_code < 500:
                 response.raise_for_status()
                 return parse_spec(response.text, url)
             problem = f"HTTP {response.status_code}"
-        except httpx.HTTPStatusError as e:
+        except httpx2.HTTPStatusError as e:
             raise RuntimeError(f"{url} answered HTTP {e.response.status_code}.") from e
-        except httpx.HTTPError as e:
+        except httpx2.HTTPError as e:
             problem = str(e) or e.__class__.__name__
         if time.monotonic() >= deadline:
             raise RuntimeError(f"{url} not reachable after {wait:g}s ({problem}).")
@@ -1037,7 +698,7 @@ def describe_tool(route, component) -> None:
     component.output_schema = None
 
 
-def register_file_tools(mcp: FastMCP, client: httpx.AsyncClient) -> None:
+def register_file_tools(mcp: FastMCP, client: httpx2.AsyncClient) -> None:
     """Register working replacements for the three file-returning tools.
 
     The spec types download, preview and thumb as `application/json`, but they
@@ -1092,7 +753,7 @@ def register_file_tools(mcp: FastMCP, client: httpx.AsyncClient) -> None:
         return await fetch(FILE_PATHS["documents_thumb_retrieve"], id)
 
 
-def register_upload_tool(mcp: FastMCP, client: httpx.AsyncClient) -> None:
+def register_upload_tool(mcp: FastMCP, client: httpx2.AsyncClient) -> None:
     """Register a working replacement for the generated upload tool.
 
     `/api/documents/post_document/` takes a multipart form with the file in it.
@@ -1188,9 +849,8 @@ def resolve_auth_mode() -> str:
     return mode
 
 
-def build_oauth_provider(mode: str) -> PaperlessOAuthProvider:
-    """OAuth provider on a Fernet-encrypted file store (same pattern as
-    FastMCP's own OAuthProxy)."""
+def validate_base_url() -> str:
+    """MCP_BASE_URL as an OAuth issuer: HTTPS, or plain http for localhost only."""
     base_url = os.environ[BASE_URL_ENV].strip().rstrip("/")
     try:
         validate_issuer_url(AnyHttpUrl(base_url))
@@ -1199,32 +859,89 @@ def build_oauth_provider(mode: str) -> PaperlessOAuthProvider:
             f"{BASE_URL_ENV}={base_url!r} is not a valid OAuth issuer: {e} "
             f"(plain http is only allowed for localhost)."
         ) from e
-    OAUTH_STORE_DIR.mkdir(parents=True, exist_ok=True)
-    files = FileTreeStore(
-        data_directory=OAUTH_STORE_DIR,
-        key_sanitization_strategy=FileTreeV1KeySanitizationStrategy(OAUTH_STORE_DIR),
-        collection_sanitization_strategy=FileTreeV1CollectionSanitizationStrategy(
-            OAUTH_STORE_DIR
-        ),
-    )
-    store = FernetEncryptionWrapper(
-        key_value=files,
-        source_material=os.environ[OAUTH_SECRET_ENV],
-        salt="paperless-ngx-mcp-oauth",
-        # A changed secret turns stored state into misses: clients just log in again.
-        raise_on_decryption_error=False,
-    )
-    return PaperlessOAuthProvider(
-        base_url=base_url,
-        store=store,
-        paperless=httpx.AsyncClient(base_url=server_url(), timeout=60),
-        passthrough=mode == "both",
+    return base_url
+
+
+def build_oauth_store() -> AsyncKeyValue:
+    """Fernet-encrypted file store under OAUTH_STORE_DIR (mcp-login-oauth)."""
+    return build_store(OAUTH_STORE_DIR, os.environ[OAUTH_SECRET_ENV], OAUTH_STORE_SALT)
+
+
+SSO_GROUP = "Signed in through single sign-on, with no Paperless password?"
+LOGIN_FIELDS = [
+    LoginField("username", "Paperless username", autocomplete="username"),
+    LoginField("password", "Paperless password", type="password",
+               autocomplete="current-password"),
+    LoginField("code", "Two-factor code, if enabled", autocomplete="one-time-code",
+               inputmode="numeric"),
+    LoginField("token", "API token", type="password", autocomplete="off",
+               group=SSO_GROUP,
+               hint="Paste the API token from My Profile in Paperless instead, and "
+                    "leave the fields above empty."),
+]
+
+
+def build_oauth_provider(
+    mode: str,
+    paperless: httpx2.AsyncClient | None = None,
+    store: AsyncKeyValue | None = None,
+) -> LoginOAuthProvider:
+    """OAuth whose login is the Paperless login (mcp-login-oauth).
+
+    Username, password and optional two-factor code are traded for the user's
+    API token at Paperless's /api/token/ (which creates it if the user has
+    none). Single-sign-on accounts have no password to trade, so they paste the
+    token instead, checked against /api/profile/. The token is the grant, read
+    by PaperlessTokenAuth. In `both` mode a bearer that isn't one of ours is
+    forwarded as a raw API token; Paperless judges it. `paperless` and `store`
+    are injectable for testing.
+
+    There is no on_revoke: Paperless keeps ONE API token per user, shared by
+    every client of that user and by the web UI, so revoking one client must
+    never touch it.
+    """
+    paperless = paperless or httpx2.AsyncClient(base_url=server_url(), timeout=60)
+
+    async def check_login(form) -> dict:
+        # Credentials go straight to Paperless and are never stored or logged.
+        pasted = strip_scheme(form["token"])
+        if pasted:
+            # Any authenticated endpoint tells us whether the token is real.
+            response = await paperless.get(
+                "/api/profile/", headers={"Authorization": f"Token {pasted}"}
+            )
+            if not response.is_success:
+                raise LoginRejected(
+                    f"Paperless rejected the API token (HTTP {response.status_code})."
+                )
+            return {"paperless_token": pasted}
+        if not form["username"] or not form["password"]:
+            raise LoginRejected("Enter your username and password, or an API token.")
+        body = {"username": form["username"], "password": form["password"]}
+        if code := form["code"].strip():
+            body["code"] = code
+        response = await paperless.post("/api/token/", json=body)
+        if not response.is_success:
+            raise LoginRejected(_rejection(response))
+        return {"paperless_token": response.json()["token"]}
+
+    async def verify_static(token: str) -> dict:
+        return {"paperless_token": token}
+
+    return LoginOAuthProvider(
+        base_url=validate_base_url(),
+        store=store if store is not None else build_oauth_store(),
+        service_name="Paperless-ngx",
+        fields=LOGIN_FIELDS,
+        check_login=check_login,
+        verify_static=verify_static if mode == "both" else None,
+        token_prefix=OAUTH_TOKEN_PREFIX,
     )
 
 
 def build_server(
-    client: httpx.AsyncClient | None = None,
-    auth: PaperlessOAuthProvider | None = None,
+    client: httpx2.AsyncClient | None = None,
+    auth: LoginOAuthProvider | None = None,
     spec: dict | None = None,
 ) -> FastMCP:
     """Turn the Paperless OpenAPI spec into a FastMCP server, one tool per
@@ -1234,14 +951,14 @@ def build_server(
     `client` and `spec` are injectable for testing; in production the spec is
     downloaded from Paperless (see resolve_spec) and the default client targets
     PAPERLESS_URL and authenticates from the per-request token. `auth` enables
-    OAuth (see PaperlessOAuthProvider); None keeps plain token pass-through.
+    OAuth (see build_oauth_provider); None keeps plain token pass-through.
     """
     if spec is None:
         spec, source = resolve_spec()
         print(f"OpenAPI spec: {source}", file=sys.stderr)
     version = api_version(spec)
     if client is None:
-        client = httpx.AsyncClient(
+        client = httpx2.AsyncClient(
             base_url=server_url(),
             auth=PaperlessTokenAuth(),
             headers=paperless_headers(version),
@@ -1311,41 +1028,21 @@ def build_error_server(error: BaseException) -> FastMCP:
     return mcp
 
 
-class BearerPrefixMiddleware:
-    """`both` mode: turn the header forms token-mode clients send -- a raw
-    `Authorization: <token>` or Paperless's own `Token <token>` -- into
-    `Bearer <token>`, the only form FastMCP's OAuth middleware reads.
-    PaperlessOAuthProvider.verify_token then passes it through to Paperless.
-    Pure ASGI, like TokenCaptureMiddleware.
-    """
-
-    def __init__(self, app) -> None:
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "http":
-            headers = []
-            for name, value in scope.get("headers") or []:
-                if name == b"authorization" and value.strip():
-                    value = b"Bearer " + strip_scheme(value.decode("latin-1")).encode("latin-1")
-                headers.append((name, value))
-            scope = {**scope, "headers": headers}
-        await self.app(scope, receive, send)
-
-
 def wrap_app(inner, mode: str):
     """Put the auth-mode's ASGI gate in front of FastMCP's app."""
     if mode == "token":
         return TokenCaptureMiddleware(inner)
     if mode == "both":
-        return BearerPrefixMiddleware(inner)
+        # Token-mode clients send a raw token or Paperless's own `Token <x>`;
+        # FastMCP only reads Bearer, then verify_static passes it through.
+        return BearerPrefixMiddleware(inner, schemes=("Token",))
     return inner
 
 
 def serve(mcp: FastMCP, mode: str = "token") -> None:
     """Serve an MCP server over streamable HTTP using the MCP_* environment
     configuration. In `token` mode TokenCaptureMiddleware gates the endpoint;
-    otherwise FastMCP's OAuth middleware does (see PaperlessOAuthProvider)."""
+    otherwise FastMCP's OAuth middleware does (see build_oauth_provider)."""
     host = os.environ.get(MCP_HOST_ENV, DEFAULT_HOST)
     port = int(os.environ.get(MCP_PORT_ENV, DEFAULT_PORT))
     path = os.environ.get(MCP_PATH_ENV, DEFAULT_PATH)

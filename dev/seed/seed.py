@@ -12,7 +12,7 @@ import sys
 import time
 from pathlib import Path
 
-import httpx
+import httpx2
 
 URL = os.environ.get("PAPERLESS_URL", "http://paperless:8000").rstrip("/")
 USER = os.environ.get("PAPERLESS_ADMIN_USER", "admin")
@@ -42,15 +42,15 @@ FILES = {
 }
 
 
-def login() -> httpx.Client:
+def login() -> httpx2.Client:
     """An API client holding the admin's token. The admin user is created by
     Paperless on first start, which can lag a little behind the healthcheck."""
     for _ in range(60):
-        response = httpx.post(
+        response = httpx2.post(
             f"{URL}/api/token/", json={"username": USER, "password": PASSWORD}, timeout=30
         )
         if response.is_success:
-            return httpx.Client(
+            return httpx2.Client(
                 base_url=URL,
                 headers={"Authorization": f"Token {response.json()['token']}"},
                 timeout=60,
@@ -59,7 +59,7 @@ def login() -> httpx.Client:
     sys.exit(f"could not log in to {URL} as {USER}: HTTP {response.status_code}")
 
 
-def create_all(api: httpx.Client, path: str, names: list[str]) -> dict[str, int]:
+def create_all(api: httpx2.Client, path: str, names: list[str]) -> dict[str, int]:
     ids = {}
     for name in names:
         response = api.post(path, json={"name": name})
@@ -68,7 +68,7 @@ def create_all(api: httpx.Client, path: str, names: list[str]) -> dict[str, int]
     return ids
 
 
-def document_count(api: httpx.Client) -> int:
+def document_count(api: httpx2.Client) -> int:
     response = api.get("/api/documents/", params={"page_size": 1})
     response.raise_for_status()
     return response.json()["count"]

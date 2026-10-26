@@ -42,6 +42,8 @@ With `MCP_BASE_URL` and `MCP_OAUTH_SECRET` set, clients that support the MCP aut
 - Raw API tokens in the `Authorization` header keep working in the default `both` mode.
 - Mount a volume at `/data` (see the [compose examples](compose-examples.md)) so logins survive the container being recreated, for example on an image update.
 - Paperless allows five login attempts a minute, counted per client address. Every login through the Paperless-ngx MCP server arrives from the sidecar's address, so that budget is shared by all its users. The login page shows Paperless's "try again in N seconds" when it is used up; raise it with Paperless's `PAPERLESS_TOKEN_THROTTLE_RATE` if you need to.
+- A login link stops working after five wrong passwords; the client starts a new login.
+- Upgrading from 0.3.x to 0.4.0 logs every OAuth client out once: the login store changed format. Reconnect each connector; raw API tokens are unaffected.
 
 An invalid `MCP_AUTH_MODE`, or an explicit `oauth`/`both` without its variables, starts the server in the [`startup_error` state](security.md#startup-errors).
 

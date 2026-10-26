@@ -20,7 +20,19 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  test:
+    # Unit tests plus the live tests against a disposable, seeded Paperless
+    # (run-tests.sh starts the docker-compose stack and removes it afterwards).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: ./run-tests.sh -q
+
   publish:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
