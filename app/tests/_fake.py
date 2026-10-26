@@ -1,10 +1,10 @@
 """Shared pieces for the unit tests: the bundled spec and an in-process MCP
-server whose Paperless is an httpx mock transport, so nothing touches the
+server whose Paperless is an httpx2 mock transport, so nothing touches the
 network."""
 
 from contextlib import asynccontextmanager
 
-import httpx
+import httpx2
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 
@@ -15,13 +15,13 @@ BASE = "http://paperless:8000"
 STATISTICS = {"documents_total": 6, "tag_count": 5}
 
 
-def paperless_client(handler) -> httpx.AsyncClient:
+def paperless_client(handler) -> httpx2.AsyncClient:
     """The client build_server would make, with `handler` standing in for Paperless."""
-    return httpx.AsyncClient(
+    return httpx2.AsyncClient(
         base_url=BASE,
         auth=server.PaperlessTokenAuth(),
         headers=server.paperless_headers(server.api_version(SPEC)),
-        transport=httpx.MockTransport(handler),
+        transport=httpx2.MockTransport(handler),
     )
 
 
@@ -30,11 +30,11 @@ def build(handler, auth=None):
 
 
 def asgi_factory(app):
-    """An httpx client factory that routes requests into an ASGI app."""
+    """An httpx2 client factory that routes requests into an ASGI app."""
     def factory(**kw):
         kw.pop("transport", None)
-        return httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://localhost", **kw
+        return httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://localhost", **kw
         )
     return factory
 

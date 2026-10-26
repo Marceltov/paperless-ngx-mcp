@@ -107,13 +107,13 @@ def test_download_and_preview_return_the_file():
     for tool in ("documents_download_retrieve", "documents_preview_retrieve"):
         resource = run_async(call(tool, {"id": document_id})).content[0].resource
         # The seeded files are text, which FastMCP embeds as text, not base64.
-        assert resource.mimeType == "text/plain"
+        assert resource.mime_type == "text/plain"
         assert "INVOICE No. AC-2026-0317" in resource.text
 
 
 def test_thumbnail_is_an_image():
     content = run_async(call("documents_thumb_retrieve", {"id": _invoice_id()})).content[0]
-    assert content.type == "image" and content.mimeType.startswith("image/")
+    assert content.type == "image" and content.mime_type.startswith("image/")
 
 
 def test_bulk_edit_adds_and_removes_a_tag():

@@ -30,6 +30,7 @@ nav:
           - OAuth login via the Paperless login: adr/0001-oauth-login-via-the-paperless-login.md
           - OpenAPI spec downloaded at startup: adr/0002-openapi-spec-downloaded-at-startup.md
           - Curated default toolsets: adr/0003-curated-default-toolsets.md
+          - OAuth through mcp-login-oauth: adr/0004-oauth-through-mcp-login-oauth.md
   - Project:
       - Contributing: contributing.md
 

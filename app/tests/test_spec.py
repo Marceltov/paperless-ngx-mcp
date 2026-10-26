@@ -1,7 +1,7 @@
 import asyncio
 import json
 
-import httpx
+import httpx2
 import pytest
 
 import server
@@ -11,20 +11,20 @@ MINI = {"openapi": "3.0.3", "info": {"version": "9.9.9 (42)"}, "paths": {"/api/t
 
 
 def _serve(monkeypatch, responder):
-    """Replace httpx.get (what download_spec uses) and record the calls."""
+    """Replace httpx2.get (what download_spec uses) and record the calls."""
     calls = []
 
     def fake_get(url, **kw):
         calls.append((url, kw))
-        return responder(len(calls), httpx.Request("GET", url))
+        return responder(len(calls), httpx2.Request("GET", url))
 
-    monkeypatch.setattr(server.httpx, "get", fake_get)
+    monkeypatch.setattr(server.httpx2, "get", fake_get)
     monkeypatch.setattr(server.time, "sleep", lambda _s: None)
     return calls
 
 
 def _ok(_n, request):
-    return httpx.Response(200, text=json.dumps(MINI), request=request)
+    return httpx2.Response(200, text=json.dumps(MINI), request=request)
 
 
 @pytest.fixture(autouse=True)
@@ -46,9 +46,9 @@ def test_spec_is_downloaded_from_the_paperless_instance(monkeypatch):
 def test_download_retries_while_paperless_boots(monkeypatch):
     def booting(n, request):
         if n == 1:
-            raise httpx.ConnectError("refused", request=request)
+            raise httpx2.ConnectError("refused", request=request)
         if n == 2:
-            return httpx.Response(502, request=request)
+            return httpx2.Response(502, request=request)
         return _ok(n, request)
 
     calls = _serve(monkeypatch, booting)
@@ -60,7 +60,7 @@ def test_falls_back_to_the_bundled_spec_when_download_fails(monkeypatch, capsys)
     monkeypatch.setenv(server.SPEC_WAIT_ENV, "0")
 
     def down(_n, request):
-        raise httpx.ConnectError("refused", request=request)
+        raise httpx2.ConnectError("refused", request=request)
 
     _serve(monkeypatch, down)
     spec, source = server.resolve_spec()
@@ -70,7 +70,7 @@ def test_falls_back_to_the_bundled_spec_when_download_fails(monkeypatch, capsys)
 
 def test_a_refused_schema_is_not_retried(monkeypatch):
     # 401/403/404 won't fix themselves; don't sit out the whole wait.
-    calls = _serve(monkeypatch, lambda _n, r: httpx.Response(403, request=r))
+    calls = _serve(monkeypatch, lambda _n, r: httpx2.Response(403, request=r))
     with pytest.raises(RuntimeError, match="HTTP 403"):
         server.download_spec("http://paperless:8000/api/schema/", wait=60)
     assert len(calls) == 1
@@ -113,7 +113,7 @@ def test_api_version_comes_from_the_spec(monkeypatch):
 def _tool_names(monkeypatch, toolsets: str | None = None) -> set[str]:
     if toolsets is not None:
         monkeypatch.setenv(server.TOOLSETS_ENV, toolsets)
-    mcp = build(lambda request: httpx.Response(404))
+    mcp = build(lambda request: httpx2.Response(404))
     return {t.name for t in asyncio.run(mcp.list_tools())}
 
 

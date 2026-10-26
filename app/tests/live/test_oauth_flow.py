@@ -8,7 +8,7 @@ import httpx
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 
-from tests.live._client import MCP_URL, PASSWORD, USERNAME, run_async
+from tests.live._client import MCP_URL, PASSWORD, USERNAME, call, run_async
 
 BASE = str(httpx.URL(MCP_URL).copy_with(path="/", query=None)).rstrip("/")
 REDIRECT = "http://localhost:9/cb"
@@ -32,7 +32,10 @@ def _login(http: httpx.Client) -> dict:
     })
     pending = httpx.URL(r.headers["location"]).params["id"]
     r = http.post("/login", data={"id": pending, "username": USERNAME, "password": PASSWORD})
-    code = httpx.URL(r.headers["location"]).params["code"]
+    back = httpx.URL(r.headers["location"])
+    # RFC 9207: the redirect names the issuer, so a client can't be mixed up.
+    assert back.params["iss"].rstrip("/") == BASE
+    code = back.params["code"]
     tokens = http.post("/token", data={
         "grant_type": "authorization_code", "code": code, "redirect_uri": REDIRECT,
         "client_id": client_id, "code_verifier": verifier,
@@ -86,3 +89,20 @@ def test_wrong_password_shows_paperless_reason_and_keeps_the_login_open():
         bad = http.post("/login", data={**form, "password": "wrong"})
         assert bad.status_code == 401 and "Paperless rejected the login" in bad.text
         assert http.post("/login", data={**form, "password": PASSWORD}).status_code == 302
+
+
+def test_revoke_kills_our_tokens_and_the_paperless_token_lives_on():
+    """Revoking one client drops only our pair: Paperless's one API token per
+    user is shared with the web UI and every other client."""
+    with httpx.Client(base_url=BASE) as http:
+        tokens = _login(http)
+        r = http.post("/revoke", data={
+            "token": tokens["refresh_token"], "client_id": tokens["client_id"],
+        })
+        assert r.status_code == 200
+        dead = http.post(
+            "/mcp", json={}, headers={"Authorization": f"Bearer {tokens['access_token']}"}
+        )
+        assert dead.status_code == 401
+    # The static token (the same Paperless API token) still works.
+    assert run_async(call("statistics_retrieve")).data["documents_total"] >= 6

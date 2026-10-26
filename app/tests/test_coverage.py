@@ -4,7 +4,7 @@ import asyncio
 import re
 from pathlib import Path
 
-import httpx
+import httpx2
 
 import server
 from tests._fake import build
@@ -30,7 +30,7 @@ _UNTESTED = {
 
 
 def _default_tool_names() -> set[str]:
-    mcp = build(lambda request: httpx.Response(404))
+    mcp = build(lambda request: httpx2.Response(404))
     return {t.name for t in asyncio.run(mcp.list_tools())}
 
 
