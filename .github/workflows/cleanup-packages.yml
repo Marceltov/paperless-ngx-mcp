@@ -1,12 +1,18 @@
 name: Cleanup untagged images
 
-# Multi-arch builds leave orphaned, untagged manifests in GHCR every push.
-# Prune only those — tagged images (:latest, :<branch>, :v*) are never touched.
+# Weekly prune of untagged GHCR versions left by multi-arch builds.
+#
+# Not actions/delete-package-versions with delete-only-untagged-versions: in a
+# multi-arch image the per-platform manifests are untagged too, and it deleted
+# them, so every image older than a week could no longer be pulled ("manifest
+# not found"; found 2026-11-26, MarcelBruckner-Homelab/homelab#720). This action
+# keeps the platform children of every tagged image, and validate checks
+# afterwards that each multi-arch image still has them.
 # Auth uses the built-in GITHUB_TOKEN; no secrets to configure.
 
 on:
   schedule:
-    - cron: "0 3 * * 0"   # weekly, Sunday 03:00 UTC
+    - cron: "0 3 * * 0"   # weekly, Sunday
   workflow_dispatch:
 
 jobs:
@@ -15,8 +21,8 @@ jobs:
     permissions:
       packages: write
     steps:
-      - uses: actions/delete-package-versions@v5
+      - uses: dataaxiom/ghcr-cleanup-action@ac45a8c04b1eb4b27974ca79a0a74f344c93664b # v1.3.0
         with:
-          package-name: paperless-ngx-mcp
-          package-type: container
-          delete-only-untagged-versions: "true"
+          package: paperless-ngx-mcp
+          delete-untagged: true
+          validate: true
