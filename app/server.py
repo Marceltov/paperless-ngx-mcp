@@ -15,6 +15,7 @@
 # You should have received a copy of the GNU Affero General Public License along
 # with this program. If not, see <https://www.gnu.org/licenses/>.
 
+import asyncio
 import base64
 import binascii
 import json
@@ -30,6 +31,7 @@ import httpx2
 import uvicorn
 import yaml
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.providers.openapi import OpenAPITool
 from fastmcp.utilities.types import File, Image
@@ -159,6 +161,67 @@ class PaperlessTokenAuth(httpx2.Auth):
             )
         request.headers["Authorization"] = f"Token {token}"
         yield request
+
+
+# Paperless 3.5 queues every bulk operation and answers {"result": "OK",
+# "task_id": ...} before it has run (paperless-ngx#14773): a tool returning then
+# reports a change that isn't there yet, and a read right after it still shows
+# the old state. So a queued answer waits for its task, and a task that failed
+# becomes the tool's error. A task still running after TASK_WAIT_SECONDS is left
+# to tasks_list; the tool returns its task_id as Paperless gave it.
+TASK_WAIT_SECONDS = 60
+TASK_POLL_SECONDS = 0.25
+TASK_FINISHED = {"success", "failure", "revoked"}
+
+
+def wait_for_queued_tasks(client: httpx2.AsyncClient):
+    """A response hook for `client` that holds a queued bulk answer until done."""
+
+    async def hook(response: httpx2.Response) -> None:
+        if response.request.method != "POST" or response.status_code != 200:
+            return
+        await response.aread()
+        try:
+            body = response.json()
+        except ValueError:
+            return
+        if not (
+            isinstance(body, dict)
+            and body.get("result") == "OK"
+            and isinstance(body.get("task_id"), str)
+        ):
+            return
+        task = await _finished_task(client, body["task_id"])
+        if task is None:
+            return
+        # The v9 API reports Celery's upper-case states, v10 lower-case ones.
+        status = str(task.get("status", "")).lower()
+        if status != "success":
+            detail = task.get("result_data") or task.get("result") or "no reason given"
+            raise ToolError(
+                f"Paperless ran the operation as task {body['task_id']}, "
+                f"and it ended with {status}: {detail}"
+            )
+
+    return hook
+
+
+async def _finished_task(client: httpx2.AsyncClient, task_id: str) -> dict | None:
+    deadline = time.monotonic() + TASK_WAIT_SECONDS
+    while True:
+        response = await client.get("/api/tasks/", params={"task_id": task_id})
+        if response.status_code == 200:
+            data = response.json()
+            rows = data.get("results", []) if isinstance(data, dict) else data
+            for task in rows:
+                if (
+                    task.get("task_id") == task_id
+                    and str(task.get("status", "")).lower() in TASK_FINISHED
+                ):
+                    return task
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(TASK_POLL_SECONDS)
 
 
 class TokenCaptureMiddleware:
@@ -568,8 +631,10 @@ Methods and their `parameters`:
 `split` {pages, delete_originals}, `delete_pages` {pages}, `edit_pdf`, \
 `remove_password` {password}: these rewrite or replace the stored files.
 
-The file-changing methods and `delete` can't be undone from here. They run \
-as background tasks, so the call returns before the work is done.""",
+The file-changing methods and `delete` can't be undone from here. Paperless \
+runs every method as a background task; the call waits for it (up to a \
+minute) and fails if the task fails. One still running after that returns \
+its `task_id`: tasks_list with that `task_id` shows when it is done.""",
     "bulk_edit_objects": """\
 Change or delete many tags, correspondents, document types or storage paths \
 at once (`object_type`): the IDs in `objects`, or all of them with \
@@ -964,6 +1029,10 @@ def build_server(
             headers=paperless_headers(version),
             timeout=60,
         )
+    client.event_hooks = {
+        **client.event_hooks,
+        "response": [*client.event_hooks["response"], wait_for_queued_tasks(client)],
+    }
 
     # Most of the API fits FastMCP's JSON-in/JSON-out assumption. What doesn't
     # is handled in one of three ways, because it fails at different layers:

@@ -63,7 +63,11 @@ docker compose down -v
 echo "== Building and starting containers =="
 # --build so the MCP server reflects the current source. The MCP container
 # starts only after the seed has finished, so its health means "seeded".
-docker compose up -d --build
+if ! docker compose up -d --build; then
+  # `up` names only the service that failed; its own output says why.
+  docker compose logs --no-color --tail 40 seed paperless
+  exit 1
+fi
 
 wait_for_health
 

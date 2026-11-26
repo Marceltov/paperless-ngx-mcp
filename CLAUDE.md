@@ -34,7 +34,7 @@ cd app && uv run --env-file ../.env.live python ../dev/live-smoke.py   # read-on
 
 Docs: `uvx --with mkdocs-material --with 'mkdocs<2' mkdocs serve` (CI builds with `--strict`). User-facing docs live in `docs/`; the README only links there, so document new config and features in `docs/`. `examples/` holds the compose examples embedded in `docs/compose-examples.md`.
 
-Workflows: `publish.yml` pushes `:<branch>` on every branch push and the versioned tags plus a GitHub release on `v*`; `pages.yml` publishes the docs on pushes to `main`; `cleanup-packages.yml` prunes untagged manifests weekly.
+Workflows: `publish.yml` pushes `:<branch>` on every branch push and the versioned tags plus a GitHub release on `v*`; `pages.yml` publishes the docs on pushes to `main`. No package cleanup: in a multi-arch image the per-platform manifests are untagged versions, and deleting untagged versions broke every release (MarcelBruckner-Homelab/homelab#720).
 
 ## Rules that are easy to break
 

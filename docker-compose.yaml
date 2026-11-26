@@ -25,6 +25,8 @@ services:
     environment:
       PAPERLESS_REDIS: redis://broker:6379
       PAPERLESS_URL: http://localhost:9190
+      # Paperless 3.5 refuses a Host not listed here: the seed and the MCP call it as paperless:8000.
+      PAPERLESS_ALLOWED_HOSTS: localhost,paperless
       PAPERLESS_SECRET_KEY: dev-only-secret-key
       # Created on first start; the seed and the tests log in with it.
       PAPERLESS_ADMIN_USER: admin
