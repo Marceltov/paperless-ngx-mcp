@@ -262,3 +262,42 @@ def test_mail_account_process_takes_only_the_id(monkeypatch):
     assert seen["method"] == "POST" and seen["path"] == "/api/mail_accounts/3/process/"
     assert seen["body"] in (b"", b"{}", b"null")
     assert "OK" in result.content[0].text
+
+
+def _queued_handler(statuses: list[str], seen: list):
+    """Paperless 3.5: a bulk call is queued, and the task list reports
+    `statuses` one poll after another."""
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen.append(f"{request.method} {request.url.path}")
+        if request.url.path == "/api/documents/bulk_edit/":
+            return httpx2.Response(200, json={"result": "OK", "task_id": "t-1"})
+        assert request.url.params["task_id"] == "t-1"
+        status = statuses.pop(0) if len(statuses) > 1 else statuses[0]
+        return httpx2.Response(200, json={"count": 1, "results": [
+            {"task_id": "t-1", "status": status, "result_data": {"error": "tag 9 does not exist"}},
+        ]})
+    return handler
+
+
+BULK = {"documents": [1], "method": "add_tag", "parameters": {"tag": 9}}
+
+
+def test_queued_bulk_edit_returns_once_its_task_is_done(monkeypatch):
+    monkeypatch.setattr(server, "TASK_POLL_SECONDS", 0)
+    seen = []
+    result = _call(_queued_handler(["pending", "started", "success"], seen), "bulk_edit", BULK)
+    assert seen == ["POST /api/documents/bulk_edit/"] + ["GET /api/tasks/"] * 3
+    assert result.structured_content["task_id"] == "t-1"
+
+
+def test_failed_bulk_task_is_the_tools_error(monkeypatch):
+    monkeypatch.setattr(server, "TASK_POLL_SECONDS", 0)
+    with pytest.raises(ToolError, match="ended with failure: .*tag 9 does not exist"):
+        _call(_queued_handler(["FAILURE"], []), "bulk_edit", BULK)
+
+
+def test_bulk_task_still_running_returns_its_task_id(monkeypatch):
+    monkeypatch.setattr(server, "TASK_POLL_SECONDS", 0)
+    monkeypatch.setattr(server, "TASK_WAIT_SECONDS", 0)
+    result = _call(_queued_handler(["started"], []), "bulk_edit", BULK)
+    assert result.structured_content == {"result": "OK", "task_id": "t-1"}
